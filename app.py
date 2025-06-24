@@ -1,31 +1,23 @@
 import os
-import json
-import time
-import glob
-import shutil
 import streamlit as st
-from google.oauth2 import service_account
+import glob
+import json
+import shutil
 from googleapiclient.discovery import build
-
-from auth.youtube_auth import authenticate_youtube
-from fetchers.youtube_fetch import fetch_youtube_stats
-from fetchers.facebook_fetch import fetch_facebook_data
+from google.oauth2 import service_account
+from auth.youtube_auth import initiate_youtube_auth, fetch_youtube_token
+from fetchers.facebook_fetch import get_facebook_oauth_url, get_facebook_page_token, get_instagram_user_id
 from fetchers.instagram_fetch import fetch_instagram_data
-from utils.sheet_utils import (
-    create_or_get_spreadsheet,
-    append_youtube_data,
-    append_channel_overview,
-    append_facebook_data,
-    append_instagram_data
-)
+from utils.sheet_utils import create_or_get_spreadsheet, append_youtube_data, append_channel_overview, append_facebook_data, append_instagram_data
 
 # --- Page Config ---
-st.set_page_config(layout="wide", page_title="Bilytica Social Media Analytics")
+st.set_page_config(layout="wide", page_title="Social Media Analytics")
+print(f"Current Working Directory: {os.getcwd()}")
 
 # --- App Title & Reset Button ---
 col_left, col_right = st.columns([6, 1])
 with col_left:
-    st.title("📊 Bilytica Social Media Analytics")
+    st.title("📊 Social Media Analytics App")
 
 with col_right:
     if st.button("🔁 Reset App to Default (Safe)"):
@@ -113,117 +105,76 @@ st.session_state.setdefault("yt_connected", False)
 st.session_state.setdefault("fb_connected", False)
 st.session_state.setdefault("ig_connected", False)
 
-# --- Upload Google client_secret.json ---
-st.header("🔐 Upload Google API Credentials")
-uploaded_file = st.file_uploader("Upload your Google client_secret.json", type="json")
-secret_path = os.path.join(user_folder, "client_secret.json")
+# --- Google OAuth Authentication ---
+st.header("🔐 Google API Authentication")
+auth_url = None
 creds = None
 
-if uploaded_file:
-    with open(secret_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+# Google OAuth logic
+if st.button("Login with Google"):
+    client_secret_path = "social_media_analytics/auth/client_secret.json"
+    flow, auth_url = initiate_youtube_auth(client_secret_path)
+    st.markdown(f"Click [here to authenticate with Google]({auth_url})")
 
-    try:
-        creds = authenticate_youtube(user_folder, secret_path)
-        st.session_state.creds = creds
-        st.success("✅ Google credentials authenticated.")
-        sheet_id_file = os.path.join(user_folder, "unified_spreadsheet.txt")
-        spreadsheet_id, _ = create_or_get_spreadsheet(creds, sheet_id_file, user_folder, username)
-    except Exception as e:
-        st.error(f"❌ Failed to authenticate: {e}")
-        st.stop()
-else:
-    st.warning("⚠️ Upload your client_secret.json to proceed.")
-    st.stop()
+# Fetch the YouTube token after redirection
+if "authorization_response" in st.session_state:
+    authorization_response = st.session_state["authorization_response"]
+    creds = fetch_youtube_token(flow, authorization_response, os.path.join(user_folder, "youtube_token.pickle"))
+    st.session_state.creds = creds
+    st.success("✅ YouTube credentials authenticated.")
 
-# --- Connect Platforms with Status ---
-st.header("🔌 Connect Platforms")
+# --- Facebook OAuth Login ---
+app_id = "<your-facebook-app-id>"
+redirect_uri = "https://socialmediaanalytics-7osbmqnplvybw5xfmvhaky.streamlit.app/"
+permissions = "public_profile,email,instagram_basic"
+
+if st.button("Connect Facebook"):
+    oauth_url = get_facebook_oauth_url(app_id, redirect_uri, permissions)
+    st.markdown(f"Click [here to authenticate with Facebook]({oauth_url})")
+
+# After Facebook Authentication, you will get the token and page ID
+if "authorization_response" in st.session_state:
+    authorization_response = st.session_state["authorization_response"]
+    fb_token = authorization_response["access_token"]
+    fb_page_id = authorization_response["page_id"]
+
+    # Get Instagram user ID after Facebook login
+    instagram_user_id = get_instagram_user_id(fb_page_id, fb_token)
+    st.session_state.instagram_user_id = instagram_user_id
+    st.session_state.facebook_token = fb_token
+    st.session_state.facebook_page_id = fb_page_id
+    st.success(f"✅ Facebook and Instagram connected successfully! Instagram User ID: {instagram_user_id}")
+
+    # Fetch Instagram Data (You can replace this with your actual data processing)
+    instagram_data = fetch_instagram_data(fb_token, instagram_user_id)
+    st.write(instagram_data)
+
+# --- YouTube + Social Media Platforms Setup ---
 col1, col2, col3 = st.columns(3)
 
 with col1:
     st.image("https://cdn-icons-png.flaticon.com/512/1384/1384060.png", width=80)
-    if st.button("Connect YouTube"):
+    if st.button("Connect YouTube", key="connect_youtube"):
         st.session_state.yt_modal = True
     yt_status = "🟢 Connected" if st.session_state.yt_connected else "🔴 Not Connected"
     st.markdown(f"**YouTube Status:** {yt_status}")
 
 with col2:
     st.image("https://cdn-icons-png.flaticon.com/512/124/124010.png", width=80)
-    if st.button("Connect Facebook"):
+    if st.button("Connect Facebook", key="connect_facebook"):
         st.session_state.fb_modal = True
     fb_status = "🟢 Connected" if st.session_state.fb_connected else "🔴 Not Connected"
     st.markdown(f"**Facebook Status:** {fb_status}")
 
 with col3:
     st.image("https://cdn-icons-png.flaticon.com/512/174/174855.png", width=80)
-    if st.button("Connect Instagram"):
+    if st.button("Connect Instagram", key="connect_instagram"):
         st.session_state.ig_modal = True
     ig_status = "🟢 Connected" if st.session_state.ig_connected else "🔴 Not Connected"
     st.markdown(f"**Instagram Status:** {ig_status}")
 
-# --- YouTube Modal ---
-if st.session_state.get("yt_modal"):
-    with st.expander("📺 YouTube Data", expanded=True):
-        try:
-            youtube = build("youtube", "v3", credentials=creds)
-            channels = youtube.channels().list(part="snippet,statistics", mine=True).execute().get("items", [])
-            if not channels:
-                st.warning("No YouTube channel found.")
-                st.stop()
 
-            channel = channels[0]
-            c_id = channel["id"]
-            stats = channel["statistics"]
-            videos = fetch_youtube_stats(creds, None, c_id)
-            st.success(f"📥 Fetched {len(videos)} videos.")
-
-            st.session_state.youtube_data = videos
-            st.session_state.youtube_stats = stats
-            st.session_state.youtube_files = {
-                "channel_id": c_id,
-                "last_video_file": os.path.join(user_folder, f"{c_id}_last.json"),
-                "channel_stats_file": os.path.join(user_folder, f"channel_{c_id}_stats.json")
-            }
-            st.session_state.yt_connected = True
-
-        except Exception as e:
-            st.error(f"YouTube error: {e}")
-
-# --- Facebook Modal ---
-if st.session_state.get("fb_modal"):
-    with st.expander("📘 Facebook Data", expanded=True):
-        fb_token = st.text_input("Enter Facebook Page Access Token", type="password", key="fb_tok")
-        fb_page = st.text_input("Enter Facebook Page ID", key="fb_id")
-        if fb_token and fb_page:
-            try:
-                fb_data = fetch_facebook_data(fb_token, fb_page)
-                if not fb_data:
-                    st.info("📭 No new Facebook posts to export.")
-                else:
-                    st.success(f"📥 Fetched {len(fb_data)} Facebook posts.")
-                    st.session_state.facebook_data = fb_data
-                    st.session_state.fb_connected = True
-            except Exception as e:
-                st.error(f"Facebook error: {e}")
-
-# --- Instagram Modal ---
-if st.session_state.get("ig_modal"):
-    with st.expander("📷 Instagram Data", expanded=True):
-        ig_token = st.text_input("Enter Instagram Access Token", type="password", key="ig_tok")
-        ig_user = st.text_input("Enter Instagram User ID", key="ig_id")
-        if ig_token and ig_user:
-            try:
-                ig_data = fetch_instagram_data(ig_token, ig_user)
-                if not ig_data:
-                    st.info("📭 No new Instagram posts to export.")
-                else:
-                    st.success(f"📥 Fetched {len(ig_data)} Instagram posts.")
-                    st.session_state.instagram_data = ig_data
-                    st.session_state.ig_connected = True
-            except Exception as e:
-                st.error(f"Instagram error: {e}")
-
-# --- Export All ---
+# --- Export Data (YouTube, Facebook, Instagram) ---
 if any([st.session_state.get("youtube_data"), st.session_state.get("facebook_data"), st.session_state.get("instagram_data")]):
     st.markdown("---")
     if st.button("🚀 Export All Data to Google Sheet"):
